@@ -1,279 +1,335 @@
-import express from "express";
-import cors from "cors";
-import dotenv from "dotenv";
-import Database from "better-sqlite3";
-import crypto from "node:crypto";
-import { randomUUID, timingSafeEqual } from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
+'use strict';
+/**
+ * Desafio da Mira 3D - Servidor SyncPIX
+ * Sem dependências externas (precisa de Node 18 ou mais novo).
+ */
+const http = require('node:http');
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 
-dotenv.config();
+// ---------- Configuração (vem das variáveis de ambiente do Render) ----------
+const PORT = process.env.PORT || 3000;
+const API_URL = (process.env.SYNCPIX_API_URL || 'https://teste.htmlcode.com.br/api/v1').replace(/\/+$/, '');
+const API_KEY = process.env.SYNCPIX_API_KEY || '';
+const WEBHOOK_SECRET = process.env.SYNCPIX_WEBHOOK_SECRET || '';
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const DB_FILE = path.join(DATA_DIR, 'db.json');
 
-const app = express();
-app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
+// Pacotes de moedas. O preço fica AQUI no servidor (em centavos), nunca no jogo.
+const PACKAGES = [
+  { id: 'p100', nome: '100 moedas', moedas: 100, preco: 500 },
+  { id: 'p550', nome: '550 moedas', moedas: 550, preco: 2500 },
+  { id: 'p1200', nome: '1200 moedas', moedas: 1200, preco: 5000 },
+  { id: 'p2600', nome: '2600 moedas', moedas: 2600, preco: 10000 },
+];
 
-// Precisamos do body bruto para validar a assinatura do webhook
-app.use(express.json({
-  verify: (req, _res, buf) => {
-    req.rawBody = buf;
+if (!API_KEY) console.warn('AVISO: SYNCPIX_API_KEY não definida.');
+if (!WEBHOOK_SECRET) console.warn('AVISO: SYNCPIX_WEBHOOK_SECRET não definida (webhooks serão recusados).');
+
+// ---------- "Banco de dados" em arquivo JSON ----------
+// ATENÇÃO: no Render grátis o disco é apagado a cada deploy/reinício.
+// Serve para TESTE. Para produção, use disco persistente ou um banco de dados.
+let db = { players: {}, orders: {}, events: {} };
+try {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (fs.existsSync(DB_FILE)) db = Object.assign(db, JSON.parse(fs.readFileSync(DB_FILE, 'utf8')));
+} catch (e) {
+  console.error('Não consegui ler o banco:', e.message);
+}
+const limite30d = Date.now() - 30 * 24 * 3600 * 1000;
+for (const [id, t] of Object.entries(db.events)) if (t < limite30d) delete db.events[id];
+
+function save() {
+  const tmp = DB_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(db));
+  fs.renameSync(tmp, DB_FILE);
+}
+function getPlayer(id) {
+  if (!db.players[id]) db.players[id] = { coins: 0, progress: {}, createdAt: Date.now() };
+  return db.players[id];
+}
+
+// ---------- Utilidades ----------
+const ID_RE = /^[A-Za-z0-9_-]{16,64}$/;
+
+function send(res, status, obj) {
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'X-Content-Type-Options': 'nosniff',
+    'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    Vary: 'Origin',
+  });
+  res.end(JSON.stringify(obj));
+}
+
+function readBody(req, limit) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > limit) {
+        reject(Object.assign(new Error('corpo grande demais'), { status: 413 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+async function readJson(req, limit = 20000) {
+  const raw = await readBody(req, limit);
+  try {
+    const obj = JSON.parse(raw.toString('utf8') || '{}');
+    if (obj === null || typeof obj !== 'object') throw new Error();
+    return obj;
+  } catch {
+    throw Object.assign(new Error('JSON inválido'), { status: 400 });
   }
-}));
+}
 
-// Banco de dados (arquivo local)
-const dataDir = path.join(process.cwd(), "data");
-if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-const db = new Database(path.join(dataDir, "desafio.db"));
-db.pragma("journal_mode = WAL");
+const hits = new Map();
+function limited(key, max, windowMs) {
+  const now = Date.now();
+  const list = (hits.get(key) || []).filter((t) => now - t < windowMs);
+  list.push(now);
+  hits.set(key, list);
+  return list.length > max;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, l] of hits) if (!l.some((t) => now - t < 3600000)) hits.delete(k);
+}, 600000).unref();
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS orders (
-    id TEXT PRIMARY KEY,
-    player_id TEXT NOT NULL,
-    package_id TEXT NOT NULL,
-    amount_cents INTEGER NOT NULL,
-    coins INTEGER NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    cobranca_id TEXT UNIQUE,
-    valor_pix INTEGER,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+function clientIp(req) {
+  return (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'x';
+}
+
+// ---------- SyncPIX ----------
+async function syncpix(method, endpoint, body, idemKey) {
+  const headers = { Authorization: `Bearer ${API_KEY}` };
+  if (body) headers['Content-Type'] = 'application/json';
+  if (idemKey) headers['Idempotency-Key'] = idemKey;
+  const r = await fetch(API_URL + endpoint, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(15000),
+  });
+  let data = null;
+  try { data = await r.json(); } catch { /* sem corpo */ }
+  return { status: r.status, data };
+}
+
+function validSignature(raw, ts, sig) {
+  if (!WEBHOOK_SECRET || !/^\d+$/.test(ts || '')) return false;
+  if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false;
+  const expected = Buffer.from(
+    'v1=' + crypto.createHmac('sha256', WEBHOOK_SECRET).update(`${ts}.${raw.toString('utf8')}`).digest('hex')
   );
-  CREATE TABLE IF NOT EXISTS balances (
-    player_id TEXT PRIMARY KEY,
-    coins INTEGER NOT NULL DEFAULT 0
-  );
-  CREATE TABLE IF NOT EXISTS grants (
-    event_id TEXT PRIMARY KEY,
-    cobranca_id TEXT NOT NULL,
-    order_id TEXT NOT NULL UNIQUE,
-    player_id TEXT NOT NULL,
-    coins INTEGER NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-`);
+  const got = Buffer.from(sig || '');
+  return expected.length === got.length && crypto.timingSafeEqual(expected, got);
+}
 
-// Pacotes de moedas (valores em centavos)
-// Você pode alterar depois
-const PACKAGES = {
-  moedas_100:  { amountCents: 490,  coins: 100,  label: "100 moedas" },
-  moedas_500:  { amountCents: 1990, coins: 500,  label: "500 moedas" },
-  moedas_1200: { amountCents: 3990, coins: 1200, label: "1.200 moedas" },
-  moedas_3000: { amountCents: 8990, coins: 3000, label: "3.000 moedas" }
-};
-
-const SYNCPIX_BASE = "https://teste.htmlcode.com.br/api/v1";
-
-function requireConfig(res) {
-  if (!process.env.SYNCPIX_API_KEY || !process.env.SYNCPIX_WEBHOOK_SECRET || !process.env.PUBLIC_BASE_URL) {
-    res.status(503).json({ error: "Servidor ainda não configurado. Faltam variáveis de ambiente." });
-    return false;
-  }
+// ---------- Crédito das moedas (um único ponto, idempotente) ----------
+function creditOrder(order) {
+  // Tudo síncrono: não há como duas execuções creditarem a mesma compra.
+  if (order.status === 'pago') return false;
+  order.status = 'pago';
+  order.pagoEm = Date.now();
+  getPlayer(order.playerId).coins += order.moedas;
+  save();
+  console.log(`Pago: pedido ${order.id} -> +${order.moedas} moedas para ${order.playerId}`);
   return true;
 }
 
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "Desafio da Mira - SyncPIX", ambiente: "teste" });
-});
+// Confirma NA API do SyncPIX (com a chave secreta) antes de liberar moedas.
+async function confirmWithApi(order) {
+  const r = await syncpix('GET', `/cobrancas/${encodeURIComponent(order.chargeId)}`);
+  if (r.status !== 200 || !r.data) throw new Error(`consulta falhou (${r.status})`);
+  const c = r.data;
+  const igual = c.id === order.chargeId && c.referencia_externa === order.id && Number(c.valor) === order.valorPix;
+  if (!igual) return { ok: false, status: 'divergente' };
+  return { ok: c.status === 'pago', status: c.status };
+}
 
-// Lista de pacotes (o jogo busca daqui)
-app.get("/api/packages", (_req, res) => {
-  const list = Object.entries(PACKAGES).map(([id, p]) => ({
-    id,
-    label: p.label,
-    coins: p.coins,
-    price: (p.amountCents / 100).toFixed(2).replace(".", ",")
-  }));
-  res.json(list);
-});
+async function reconcile(order) {
+  const res = await confirmWithApi(order);
+  if (res.ok) creditOrder(order);
+  else if ((res.status === 'expirado' || res.status === 'cancelado') && order.status === 'pendente') {
+    order.status = res.status;
+    save();
+  }
+}
 
-// Cria cobrança Pix
-app.post("/api/create-pix", async (req, res) => {
-  if (!requireConfig(res)) return;
+// ---------- Rotas ----------
+async function handle(req, res) {
+  const url = new URL(req.url, 'http://x');
+  const parts = url.pathname.split('/').filter(Boolean);
+  const route = `${req.method} /${parts[0] || ''}${parts[1] ? '/' + parts[1] : ''}`;
 
-  const { playerId, packageId } = req.body || {};
+  if (req.method === 'OPTIONS') return send(res, 204, {});
 
-  if (typeof playerId !== "string" || playerId.length < 8 || playerId.length > 120) {
-    return res.status(400).json({ error: "Identificador de jogador inválido." });
+  if (route === 'GET /' || route === 'GET /health') {
+    return send(res, 200, {
+      ok: true,
+      ambiente: API_KEY.startsWith('sk_live_') ? 'producao' : 'teste',
+      configurado: Boolean(API_KEY && WEBHOOK_SECRET),
+    });
   }
 
-  const pack = PACKAGES[packageId];
-  if (!pack) return res.status(400).json({ error: "Pacote inválido." });
+  if (route === 'GET /api/packages') {
+    return send(res, 200, PACKAGES.map((p) => ({ id: p.id, nome: p.nome, moedas: p.moedas, preco: p.preco })));
+  }
 
-  const orderId = randomUUID();
+  if (route === 'POST /api/create-pix') {
+    if (limited('ip:' + clientIp(req), 20, 10 * 60 * 1000)) return send(res, 429, { erro: 'Muitas tentativas. Aguarde um pouco.' });
+    const { playerId, packageId } = await readJson(req);
+    const pkg = PACKAGES.find((p) => p.id === packageId);
+    if (!ID_RE.test(String(playerId || '')) || !pkg) return send(res, 400, { erro: 'Dados inválidos.' });
 
-  db.prepare(`
-    INSERT INTO orders (id, player_id, package_id, amount_cents, coins)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(orderId, playerId, packageId, pack.amountCents, pack.coins);
+    const pendentes = Object.values(db.orders).filter(
+      (o) => o.playerId === playerId && o.status === 'pendente' && Date.now() - o.createdAt < 3600000
+    ).length;
+    if (pendentes >= 5) return send(res, 429, { erro: 'Você tem Pix pendentes demais. Pague ou aguarde expirar.' });
 
-  try {
-    const response = await fetch(`${SYNCPIX_BASE}/cobrancas`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.SYNCPIX_API_KEY}`,
-        "Content-Type": "application/json",
-        "Idempotency-Key": orderId
-      },
-      body: JSON.stringify({
-        valor: pack.amountCents,
-        descricao: `Desafio da Mira - ${pack.label}`,
+    const orderId = crypto.randomUUID();
+    const r = await syncpix(
+      'POST',
+      '/cobrancas',
+      {
+        valor: pkg.preco,
+        descricao: `Desafio da Mira 3D - ${pkg.nome}`.slice(0, 140),
         referencia_externa: orderId,
-        expiracao: 1800, // 30 minutos
-        metadata: {
-          player_id: playerId,
-          package_id: packageId
-        }
-      })
-    });
-
-    const data = await response.json();
-
-    if (response.status !== 201) {
-      console.error("SyncPIX erro ao criar cobrança:", data);
-      db.prepare("UPDATE orders SET status='error' WHERE id=?").run(orderId);
-      return res.status(502).json({
-        error: data?.erro?.mensagem || "Não foi possível gerar o Pix. Tente novamente."
-      });
+        expiracao: 1800,
+        metadata: { playerId, packageId: pkg.id },
+      },
+      `order-${orderId}`
+    );
+    if (r.status !== 201 || !r.data || !r.data.pix) {
+      console.error('Erro ao criar cobrança:', r.status, JSON.stringify(r.data));
+      return send(res, 502, { erro: 'Não foi possível gerar o Pix agora. Tente de novo.' });
     }
-
-    // Guarda o ID da cobrança e o valor final (pode ter centavos exclusivos)
-    db.prepare("UPDATE orders SET cobranca_id=?, valor_pix=?, status='pending' WHERE id=?")
-      .run(data.id, data.valor, orderId);
-
-    return res.json({
+    const c = r.data;
+    db.orders[orderId] = {
+      id: orderId,
+      playerId,
+      packageId: pkg.id,
+      moedas: pkg.moedas,
+      valorBase: pkg.preco,
+      valorPix: Number(c.valor), // pode ter centavos exclusivos a mais
+      chargeId: c.id,
+      status: 'pendente',
+      createdAt: Date.now(),
+      lastCheck: 0,
+    };
+    getPlayer(playerId);
+    save();
+    return send(res, 201, {
       orderId,
-      cobrancaId: data.id,
-      status: data.status,
-      valor: data.valor,
-      copiaECola: data.pix?.copia_e_cola || null,
-      qrCodeBase64: data.pix?.qr_code_base64 || null,
-      linkPagamento: data.link_pagamento || null,
-      expiraEm: data.pix?.expira_em || null
+      valor: Number(c.valor),
+      copiaECola: c.pix.copia_e_cola,
+      qrCode: c.pix.qr_code_base64,
+      expiraEm: c.pix.expira_em,
+      linkPagamento: c.link_pagamento,
     });
-  } catch (err) {
-    console.error("Erro ao criar cobrança:", err);
-    db.prepare("UPDATE orders SET status='error' WHERE id=?").run(orderId);
-    return res.status(500).json({ error: "Erro interno ao gerar Pix." });
-  }
-});
-
-// Valida assinatura do webhook SyncPIX
-function validarAssinatura(req) {
-  const secret = process.env.SYNCPIX_WEBHOOK_SECRET;
-  const ts = req.get("X-Webhook-Timestamp") || "";
-  const assinatura = req.get("X-Webhook-Assinatura") || "";
-  const corpo = req.rawBody ? req.rawBody.toString("utf8") : "";
-
-  if (!secret || !ts || !assinatura || !corpo) return false;
-  if (!/^\d+$/.test(ts)) return false;
-  if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false; // 5 minutos
-
-  const esperada = "v1=" + crypto
-    .createHmac("sha256", secret)
-    .update(`${ts}.${corpo}`)
-    .digest("hex");
-
-  try {
-    const a = Buffer.from(esperada);
-    const b = Buffer.from(assinatura);
-    return a.length === b.length && timingSafeEqual(a, b);
-  } catch {
-    return false;
-  }
-}
-
-// Credita moedas de forma segura (só uma vez)
-function creditarPedido(evento) {
-  if (evento.tipo !== "cobranca.paga") return;
-
-  const cobranca = evento.dados;
-  if (!cobranca || cobranca.status !== "pago") return;
-
-  const orderId = String(cobranca.referencia_externa || "");
-  if (!orderId) return;
-
-  const order = db.prepare("SELECT * FROM orders WHERE id=?").get(orderId);
-  if (!order) return;
-
-  // Confere o valor (importante por causa dos centavos exclusivos)
-  if (order.valor_pix && Number(cobranca.valor) !== Number(order.valor_pix)) {
-    console.warn("Valor diferente do esperado", { orderId, esperado: order.valor_pix, recebido: cobranca.valor });
-    return;
   }
 
-  const grant = db.transaction(() => {
-    // Já creditou este evento ou este pedido?
-    const jaExiste = db.prepare(
-      "SELECT event_id FROM grants WHERE event_id=? OR order_id=?"
-    ).get(evento.id, orderId);
-
-    if (jaExiste) return;
-
-    // Credita as moedas
-    db.prepare(`
-      INSERT INTO balances (player_id, coins) VALUES (?, ?)
-      ON CONFLICT(player_id) DO UPDATE SET coins = coins + excluded.coins
-    `).run(order.player_id, order.coins);
-
-    // Registra a concessão (impede duplicar)
-    db.prepare(`
-      INSERT INTO grants (event_id, cobranca_id, order_id, player_id, coins)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(evento.id, cobranca.id, orderId, order.player_id, order.coins);
-
-    // Atualiza status do pedido
-    db.prepare("UPDATE orders SET status='pago', cobranca_id=? WHERE id=?")
-      .run(cobranca.id, orderId);
-  });
-
-  grant();
-  console.log(`Moedas creditadas: ${order.coins} para jogador ${order.player_id}`);
-}
-
-// Webhook do SyncPIX
-app.post("/api/webhook", (req, res) => {
-  if (!requireConfig(res)) return;
-
-  if (!validarAssinatura(req)) {
-    console.warn("Webhook com assinatura inválida");
-    return res.sendStatus(401);
-  }
-
-  try {
-    const evento = req.body;
-    if (evento && evento.id) {
-      creditarPedido(evento);
+  if (route === 'POST /api/webhook') {
+    const raw = await readBody(req, 100000);
+    const ok = validSignature(raw, req.headers['x-webhook-timestamp'], req.headers['x-webhook-assinatura']);
+    if (!ok) {
+      console.warn('Webhook recusado: assinatura inválida.');
+      return send(res, 401, { erro: 'assinatura inválida' });
     }
-    // Sempre responde 200 rápido
-    return res.sendStatus(200);
-  } catch (err) {
-    console.error("Erro no webhook:", err);
-    return res.sendStatus(500);
+    let evento;
+    try { evento = JSON.parse(raw.toString('utf8')); } catch { return send(res, 400, { erro: 'JSON inválido' }); }
+    if (!evento || !evento.id) return send(res, 400, { erro: 'evento inválido' });
+    if (db.events[evento.id]) return send(res, 200, { ok: true, repetido: true });
+
+    if (evento.tipo === 'cobranca.paga' && evento.dados) {
+      const order = db.orders[evento.dados.referencia_externa];
+      if (!order) {
+        console.warn('Pagamento sem pedido conhecido:', evento.dados.referencia_externa);
+      } else if (order.status !== 'pago') {
+        // se a consulta falhar, o erro vira 500 e o SyncPIX tenta de novo depois
+        const conf = await confirmWithApi(order);
+        if (conf.ok) creditOrder(order);
+        else console.warn('Webhook "pago" mas a API não confirmou:', order.id, conf.status);
+      }
+    } else if ((evento.tipo === 'cobranca.expirada' || evento.tipo === 'cobranca.cancelada') && evento.dados) {
+      const order = db.orders[evento.dados.referencia_externa];
+      if (order && order.status === 'pendente') {
+        order.status = evento.tipo === 'cobranca.expirada' ? 'expirado' : 'cancelado';
+        save();
+      }
+    }
+    db.events[evento.id] = Date.now();
+    save();
+    return send(res, 200, { ok: true });
   }
-});
 
-// Consulta saldo do jogador
-app.get("/api/balance/:playerId", (req, res) => {
-  const playerId = String(req.params.playerId || "");
-  if (playerId.length < 8 || playerId.length > 120) {
-    return res.status(400).json({ error: "Jogador inválido." });
+  if (route === 'GET /api/balance') {
+    const id = parts[2];
+    if (!ID_RE.test(id || '')) return send(res, 400, { erro: 'Jogador inválido.' });
+    return send(res, 200, { coins: getPlayer(id).coins });
   }
-  const row = db.prepare("SELECT coins FROM balances WHERE player_id=?").get(playerId);
-  res.json({ coins: row?.coins || 0 });
-});
 
-// Consulta status de um pedido (útil para o jogo ficar verificando)
-app.get("/api/order/:orderId", (req, res) => {
-  const orderId = String(req.params.orderId || "");
-  const order = db.prepare("SELECT id, status, coins, player_id FROM orders WHERE id=?").get(orderId);
-  if (!order) return res.status(404).json({ error: "Pedido não encontrado." });
-  res.json({
-    orderId: order.id,
-    status: order.status,
-    coins: order.coins
-  });
-});
+  if (route === 'GET /api/order') {
+    const order = db.orders[parts[2] || ''];
+    if (!order) return send(res, 404, { erro: 'Pedido não encontrado.' });
+    // Plano B caso o webhook demore: confere na API, no máximo a cada 8 segundos.
+    if (order.status === 'pendente' && Date.now() - order.lastCheck > 8000) {
+      order.lastCheck = Date.now();
+      try { await reconcile(order); } catch (e) { console.warn('Reconciliação falhou:', e.message); }
+    }
+    return send(res, 200, { status: order.status, moedas: order.moedas, coins: getPlayer(order.playerId).coins });
+  }
 
-const port = Number(process.env.PORT || 3000);
-app.listen(port, () => {
-  console.log(`Desafio da Mira (SyncPIX) rodando na porta ${port}`);
-});
+  if (route === 'POST /api/spend') {
+    const { playerId, amount } = await readJson(req);
+    const n = Number(amount);
+    if (!ID_RE.test(String(playerId || '')) || !Number.isInteger(n) || n < 1 || n > 1000000) {
+      return send(res, 400, { erro: 'Dados inválidos.' });
+    }
+    const p = getPlayer(playerId);
+    if (p.coins < n) return send(res, 409, { erro: 'Moedas insuficientes.', coins: p.coins });
+    p.coins -= n;
+    save();
+    return send(res, 200, { coins: p.coins });
+  }
+
+  if (route === 'GET /api/progress') {
+    if (!ID_RE.test(parts[2] || '')) return send(res, 400, { erro: 'Jogador inválido.' });
+    return send(res, 200, { progress: getPlayer(parts[2]).progress });
+  }
+
+  if (route === 'POST /api/progress') {
+    const { playerId, progress } = await readJson(req, 20000);
+    if (!ID_RE.test(String(playerId || '')) || typeof progress !== 'object' || progress === null) {
+      return send(res, 400, { erro: 'Dados inválidos.' });
+    }
+    getPlayer(playerId).progress = progress; // moedas NÃO ficam aqui, só no saldo do servidor
+    save();
+    return send(res, 200, { ok: true });
+  }
+
+  return send(res, 404, { erro: 'Rota não encontrada.' });
+}
+
+http
+  .createServer((req, res) => {
+    handle(req, res).catch((e) => {
+      console.error('Erro:', e.message);
+      if (!res.headersSent) send(res, e.status || 500, { erro: e.status ? e.message : 'Erro interno.' });
+    });
+  })
+  .listen(PORT, () => console.log(`Servidor rodando na porta ${PORT} (${API_URL})`));

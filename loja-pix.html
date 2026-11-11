@@ -1,0 +1,121 @@
+<!-- ===== LOJA PIX - Desafio da Mira 3D =====
+     Cole este bloco inteiro no seu jogo, logo ANTES da linha </body>.
+     Troque SERVER_URL pelo endereço do seu serviço no Render. -->
+<style>
+  #lojaBtn{position:fixed;right:12px;bottom:12px;z-index:99998;padding:12px 16px;border:0;border-radius:24px;background:#f5b800;color:#111;font:bold 16px sans-serif}
+  #lojaBox{display:none;position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.8);overflow:auto;font-family:sans-serif;color:#fff}
+  #lojaBox .in{max-width:420px;margin:20px auto;padding:16px;background:#1b1b1f;border-radius:14px}
+  #lojaBox button{padding:12px;border:0;border-radius:10px;font-size:16px}
+  #lojaBox .pkg{display:flex;justify-content:space-between;align-items:center;width:100%;margin:8px 0;background:#2d2d35;color:#fff}
+  #lojaBox .ok{background:#1fa855;color:#fff;width:100%;margin-top:8px}
+  #lojaBox img{width:230px;max-width:80%;background:#fff;padding:8px;border-radius:8px;display:block;margin:10px auto}
+  #lojaMsg{margin:10px 0;min-height:22px}
+</style>
+<button id="lojaBtn">🪙 Loja</button>
+<div id="lojaBox"><div class="in">
+  <h2 style="margin:0 0 4px">Loja de moedas</h2>
+  <div>Saldo: <b id="lojaSaldo">...</b> moedas</div>
+  <div id="lojaMsg"></div>
+  <div id="lojaLista"></div>
+  <div id="lojaPix" style="display:none">
+    <img id="lojaQr" alt="QR Code Pix">
+    <div id="lojaValor" style="text-align:center;font-weight:bold"></div>
+    <button class="ok" id="lojaCopia">Copiar código Pix (copia e cola)</button>
+  </div>
+  <button id="lojaFechar" style="width:100%;margin-top:14px;background:#444;color:#fff">Fechar</button>
+</div></div>
+<script>
+(function () {
+  var SERVER_URL = 'https://COLOQUE-AQUI.onrender.com'; // <-- TROQUE (sem barra no final)
+
+  var $ = function (id) { return document.getElementById(id); };
+  var playerId;
+  try {
+    playerId = localStorage.getItem('mira_player_id');
+    if (!playerId) { playerId = crypto.randomUUID(); localStorage.setItem('mira_player_id', playerId); }
+  } catch (e) { playerId = 'temp-' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
+
+  var timer = null, copia = '';
+  function msg(t) { $('lojaMsg').textContent = t || ''; }
+  function reais(c) { return 'R$ ' + (c / 100).toFixed(2).replace('.', ','); }
+  function api(path, body) {
+    return fetch(SERVER_URL + path, body ? {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    } : undefined).then(function (r) { return r.json().then(function (j) { j._status = r.status; return j; }); });
+  }
+  function saldo() {
+    return api('/api/balance/' + playerId).then(function (j) {
+      if (typeof j.coins === 'number') {
+        $('lojaSaldo').textContent = j.coins;
+        if (window.onMoedasAtualizadas) window.onMoedasAtualizadas(j.coins);
+      }
+      return j.coins;
+    }).catch(function () { $('lojaSaldo').textContent = '?'; });
+  }
+  function pararPolling() { if (timer) { clearInterval(timer); timer = null; } }
+  function acompanhar(orderId) {
+    pararPolling();
+    timer = setInterval(function () {
+      api('/api/order/' + orderId).then(function (j) {
+        if (j.status === 'pago') {
+          pararPolling();
+          $('lojaPix').style.display = 'none';
+          msg('✅ Pagamento confirmado! +' + j.moedas + ' moedas.');
+          $('lojaSaldo').textContent = j.coins;
+          if (window.onMoedasAtualizadas) window.onMoedasAtualizadas(j.coins);
+        } else if (j.status === 'expirado' || j.status === 'cancelado') {
+          pararPolling();
+          $('lojaPix').style.display = 'none';
+          msg('Este Pix expirou. Gere outro.');
+        }
+      }).catch(function () {});
+    }, 5000);
+  }
+  function comprar(pkgId) {
+    msg('Gerando Pix...');
+    api('/api/create-pix', { playerId: playerId, packageId: pkgId }).then(function (j) {
+      if (j._status !== 201) { msg(j.erro || 'Erro ao gerar o Pix.'); return; }
+      copia = j.copiaECola;
+      $('lojaQr').src = j.qrCode;
+      $('lojaValor').textContent = 'Pague exatamente ' + reais(j.valor);
+      $('lojaPix').style.display = 'block';
+      msg('Aguardando pagamento... (as moedas entram sozinhas)');
+      acompanhar(j.orderId);
+    }).catch(function () { msg('Sem conexão com o servidor.'); });
+  }
+  function abrir() {
+    $('lojaBox').style.display = 'block';
+    msg(''); saldo();
+    api('/api/packages').then(function (lista) {
+      var box = $('lojaLista'); box.textContent = '';
+      lista.forEach(function (p) {
+        var b = document.createElement('button');
+        b.className = 'pkg';
+        var a = document.createElement('span'); a.textContent = '🪙 ' + p.nome;
+        var c = document.createElement('b'); c.textContent = reais(p.preco);
+        b.appendChild(a); b.appendChild(c);
+        b.onclick = function () { comprar(p.id); };
+        box.appendChild(b);
+      });
+    }).catch(function () { msg('Não consegui carregar a loja.'); });
+  }
+  $('lojaBtn').onclick = abrir;
+  $('lojaFechar').onclick = function () { $('lojaBox').style.display = 'none'; pararPolling(); };
+  $('lojaCopia').onclick = function () {
+    (navigator.clipboard ? navigator.clipboard.writeText(copia) : Promise.reject())
+      .then(function () { msg('Código copiado! Cole no app do seu banco (Pix copia e cola).'); })
+      .catch(function () { msg('Não consegui copiar automaticamente.'); });
+  };
+
+  // Funções que o jogo pode usar:
+  window.LojaPix = {
+    playerId: playerId,
+    abrir: abrir,
+    saldo: saldo,
+    gastar: function (n) { return api('/api/spend', { playerId: playerId, amount: n }); },
+    salvarProgresso: function (obj) { return api('/api/progress', { playerId: playerId, progress: obj }); },
+    carregarProgresso: function () { return api('/api/progress/' + playerId).then(function (j) { return j.progress; }); }
+  };
+  saldo();
+})();
+</script>

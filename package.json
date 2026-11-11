@@ -1,18 +1,13 @@
 {
-  "name": "desafio-da-mira-syncpix",
+  "name": "desafio-mira-syncpix",
   "version": "1.0.0",
   "private": true,
-  "type": "module",
+  "description": "Servidor Pix (SyncPIX) do Desafio da Mira 3D",
+  "main": "server.js",
   "scripts": {
-    "start": "node src/server.js"
-  },
-  "dependencies": {
-    "better-sqlite3": "^11.8.1",
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.7",
-    "express": "^4.21.2"
+    "start": "node server.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=18"
   }
 }
